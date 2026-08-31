@@ -1,0 +1,204 @@
+name: intel-desktop-release
+
+# Watch NousResearch/hermes-agent for new stable releases and publish
+# unofficial x86_64 (Intel) macOS desktop packages. Apple Silicon users:
+# use the official arm64 builds from upstream instead.
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # daily 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      rebuild_existing:
+        description: "Rebuild even if this upstream tag was already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-intel-macos
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Resolve upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      upstream-tag: ${{ steps.resolve.outputs.tag }}
+      our-tag: ${{ steps.resolve.outputs.our_tag }}
+      build: ${{ steps.resolve.outputs.decision }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq '.tag_name')"
+          [[ -n "$tag" && "$tag" != "null" ]] ||
+            { echo "upstream has no stable release tag" >&2; exit 1; }
+
+          our_tag="intel-macos-$tag"
+          rebuild='${{ github.event_name == 'workflow_dispatch' && inputs.rebuild_existing }}'
+          exists="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$our_tag" --jq '.id' 2>/dev/null || true)"
+          found=false; [[ "${exists:-}" =~ ^[0-9]+$ ]] && found=true
+
+          decision=false
+          if [[ "$found" != true || "$rebuild" == "true" ]]; then decision=true; fi
+          echo "upstream $tag -> $our_tag, build=$decision (release exists: $found)"
+
+          {
+            echo "tag=$tag"
+            echo "our_tag=$our_tag"
+            echo "decision=$decision"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Build and publish Intel package
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 100
+    env:
+      UPSTREAM_TAG: ${{ needs.plan.outputs.upstream-tag }}
+      OUR_TAG: ${{ needs.plan.outputs.our-tag }}
+    steps:
+      - name: Check out upstream release tag
+        uses: actions/checkout@v5
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.plan.outputs.upstream-tag }}
+          persist-credentials: false
+
+      - name: Select Node.js LTS
+        # Pin the active Node LTS major line explicitly — `lts/*` alone can
+        # still resolve to an aliased major whose setup action emits the
+        # Node 20 deprecation warning.
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Align npm and Electron with the x64 target
+        # The runner is arm64; by default npm installs an arm64 Electron
+        # dist and electron-builder would happily package it. Point npm and
+        # the electron postinstall at x64, and upgrade npm if the runner's
+        # default falls inside the 11.10–11.16 range upstream's lockfile
+        # rejects.
+        env:
+          npm_config_arch: x64
+        run: |
+          set -euo pipefail
+          echo "node $(node --version), npm $(npm --version)"
+          case "$(npm --version)" in
+            11.1[0-5].*|11.16.*) npm install -g npm@11.17.0 ;;
+          esac
+          npm install -g npm@latest 2>/dev/null || true
+          echo "using node $(node --version), npm $(npm --version)"
+
+      - name: Install dependencies
+        env:
+          npm_config_arch: x64
+        run: npm ci
+
+      - name: Sanity-check the Electron distribution arch
+        run: |
+          set -euo pipefail
+          dist="apps/desktop/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
+          archs="$(lipo -archs "$dist" 2>/dev/null || file -b "$dist")"
+          echo "electron dist: $archs"
+          echo "$archs" | grep -q x86_64 ||
+            { echo "electron dist is not x86_64; x64 postinstall failed" >&2; exit 1; }
+
+      - name: Build x86_64 bundle
+        working-directory: apps/desktop
+        env:
+          npm_config_arch: x64
+        # Strip GITHUB_SHA so upstream's stamp script records the checked-out
+        # upstream commit rather than this workflow's commit.
+        run: |
+          set -euo pipefail
+          env -u GITHUB_SHA -u GITHUB_REF_NAME \
+            npm run dist:mac -- --x64 --publish never
+
+      - name: Verify x86_64 binaries
+        id: verify
+        working-directory: apps/desktop/release
+        run: |
+          set -euo pipefail
+          fail() { echo "$1" >&2; exit 1; }
+
+          exe="$(find . -path '*/Hermes.app/Contents/MacOS/Hermes' -type f -print -quit)"
+          [[ -n "$exe" ]] || fail "Hermes executable not found in release output"
+          file "$exe" | grep -q x86_64 || fail "main executable is not x86_64"
+          grep -q arm64 "$(file "$exe")" 2>/dev/null && fail "unexpected arm64 slice" || true
+
+          # Native payloads (node-pty etc.) must be x86_64 too.
+          n=0
+          while IFS= read -r -d '' f; do
+            file "$f" | grep -q x86_64 || fail "not x86_64: $f"
+            n=$((n + 1))
+          done < <(find . -type f -name '*.node' -print0)
+          (( n >= 1 )) || fail "no native .node binaries were packaged"
+          echo "verified $n native binary/b binaries as x86_64"
+
+          dmg="$(find . -name '*-mac-x64.dmg' -print -quit)"
+          zip="$(find . -name '*-mac-x64.zip' -print -quit)"
+          [[ -n "$dmg" && -n "$zip" ]] || fail "expected one DMG and one ZIP"
+          hdiutil verify "$dmg" >/dev/null
+          echo "dmg=$PWD/$(basename "$dmg")" >> "$GITHUB_OUTPUT"
+
+      - name: Rename artifacts
+        id: rename
+        working-directory: apps/desktop/release
+        env:
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream-tag }}
+        run: |
+          set -euo pipefail
+          stem="Hermes-${UPSTREAM_TAG#v}-mac-x64"
+          mv *-mac-x64.dmg "$stem.dmg"
+          mv *-mac-x64.zip "$stem.zip"
+          # Checksums are shown per-asset on the GitHub release page; no
+          # separate SHA256SUMS file needed.
+          shasum -a 256 "$stem.dmg" "$stem.zip"
+          {
+            echo "dmg=$PWD/$stem.dmg"
+            echo "zip=$PWD/$stem.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ steps.rename.outputs.dmg }}
+          ZIP: ${{ steps.rename.outputs.zip }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          Unofficial x86_64 (Intel) community rebuild of the official
+          [Hermes $UPSTREAM_TAG](https://github.com/NousResearch/hermes-agent/releases/tag/$UPSTREAM_TAG)
+          desktop app. Apple Silicon users should prefer the official upstream packages.
+
+          Not affiliated with Nous Research; **not signed or notarized**.
+          First launch: right-click Hermes.app → Open, or
+          \`xattr -dr com.apple.quarantine /Applications/Hermes.app\`.
+
+          SHA-256 checksums are shown on each asset below.
+          EOF
+          sed -i '' 's/^          //' "$notes"
+
+          # Idempotent publish: a forced rebuild may replace an existing
+          # release, and a release create that succeeded partially (e.g. a
+          # retry after an upload failure) should not error the run.
+          if gh release view "$OUR_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $OUR_TAG already exists; uploading assets"
+            gh release upload "$OUR_TAG" --repo "$GITHUB_REPOSITORY" --clobber "$DMG" "$ZIP"
+          else
+            gh release create "$OUR_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Hermes $UPSTREAM_TAG — macOS Intel (community)" \
+              --notes-file "$notes" \
+              "$DMG" "$ZIP"
+          fi
