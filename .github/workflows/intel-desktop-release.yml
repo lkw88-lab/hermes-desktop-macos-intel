@@ -117,10 +117,17 @@ jobs:
           npm_config_arch: x64
         # Strip GITHUB_SHA so upstream's stamp script records the checked-out
         # upstream commit rather than this workflow's commit.
+        #
+        # No --publish never here: upstream's run-electron-builder.mjs already
+        # pins publish to "never" (since v2026.8.31) so electron-builder does
+        # not try to resolve a GitHub publish target under CI=1. Passing it
+        # again makes yargs collect ["never","never"] and electron-builder
+        # treats that as a real publish request, failing with "GitHub Personal
+        # Access Token is not set".
         run: |
           set -euo pipefail
           env -u GITHUB_SHA -u GITHUB_REF_NAME \
-            npm run dist:mac -- --x64 --publish never
+            npm run dist:mac -- --x64
 
       - name: Verify x86_64 binaries
         id: verify
